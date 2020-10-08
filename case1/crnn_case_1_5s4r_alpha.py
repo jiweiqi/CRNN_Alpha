@@ -31,14 +31,15 @@ parser.add_argument('--nr', type=int, default=4)
 parser.add_argument('--n_exp', type=int, default=100)
 parser.add_argument('--t_end', type=float, default=20)
 parser.add_argument('--n_steps', type=int, default=101)
-parser.add_argument('--learning_rate', type=float, default=0.001)
+parser.add_argument('--learning_rate', type=float, default=1e-4)
 parser.add_argument('--batch_size', type=int, default=128)
-parser.add_argument('--nepochs', type=int, default=7000)
-parser.add_argument('--print_freq', type=int, default=1000)
+parser.add_argument('--nepochs', type=int, default=1000)
+parser.add_argument('--print_freq', type=int, default=100)
 parser.add_argument('--checkfile', type=str, default='alpha_case_1_5s4r')
-parser.add_argument('--is_restart', action='store_true', default=True)
+parser.add_argument('--is_pruning', action='store_true', default=True)
+parser.add_argument('--pruning_threshhold', type=float, default=1e-2)
+parser.add_argument('--is_restart', action='store_true', default=False)
 args = parser.parse_args()
-
 
 class ReactorOde(object):
     def __init__(self):
@@ -228,7 +229,7 @@ if __name__ == "__main__":
 
     for i in range(args.n_exp):
         y0 = np.random.uniform(np.array([0, 0, 0, 0, 0]),
-                               np.array([1, 1, 1, 1, 1]))
+                               np.array([1, 1, 1, 1, 0]))
         y, dydt = get_solution(y0, args.t_end, args.n_steps)
         y_list.append(y.T)
         dydt_list.append(dydt.T)
@@ -238,8 +239,8 @@ if __name__ == "__main__":
     # Train CRNN Model
 
     crnn_model = CRNN_Model(ns=args.ns, nr=args.nr)
-    optimizer = torch.optim.Adam(
-        crnn_model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.Adam(crnn_model.parameters(), 
+                                 lr=args.learning_rate)
     loss_func = torch.nn.MSELoss()
 
     X_train, X_test, Y_train, Y_test = train_test_split(y_np,
@@ -267,12 +268,19 @@ if __name__ == "__main__":
     loss_list = {'epoch': [], 'train': [], 'test': [], 'nslope': []}
 
     epoch_old = 0
-    if args.is_restart is True:
+    if args.is_restart:
         checkpoint = torch.load(checkfile + '.tar')
         crnn_model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         epoch_old = checkpoint['epoch']
         loss_list = checkpoint['loss_list']
+        
+        if args.is_pruning:
+            for p in crnn_model.parameters():
+                mask = p.data.abs() < args.pruning_threshhold
+                p.data[mask] *= 0
+
+    alpha = 0e-6
 
     for epoch in tqdm(range(args.nepochs)):
         if args.is_restart:
@@ -283,10 +291,26 @@ if __name__ == "__main__":
         for i_sample, (data, label) in enumerate(train_loader):
             pred = crnn_model(data)
             loss = loss_func(pred/Y_max, label/Y_max)
+            
+            scaled_w_in = crnn_model.w_in.abs().T * crnn_model.nslope()
+            w_out_max = crnn_model.w_out.abs().max(dim=1).values + eps
+            scaled_k = torch.exp(crnn_model.w_b*crnn_model.nslope()) * w_out_max
+            scaled_w_out = crnn_model.w_out.T / w_out_max
+
+            loss_reg = alpha * (scaled_w_in.norm(1) + scaled_w_out.norm(1))
+            
+            loss += loss_reg
 
             optimizer.zero_grad()
             loss.backward()
             # crnn_model.slope.grad.data *= 0
+            
+            # TODO: use scaled w_in and w_out.
+            if args.is_pruning and args.is_restart:
+                for p in crnn_model.parameters():
+                    mask = p.abs() < 0.01
+                    p.grad.data[mask] *= 0
+            
             optimizer.step()
             loss_train += loss.item()
 
@@ -304,7 +328,7 @@ if __name__ == "__main__":
         loss_list['epoch'].append(epoch)
         loss_list['nslope'].append(crnn_model.nslope())
 
-        if epoch % args.print_freq == 0:
+        if epoch % args.print_freq == 0 or epoch == args.nepochs-1:
             print("epoch: {} loss train {:.4e} test {:.4e} nslope {:.4f} pgradnorm {:.2e}".format(
                 epoch, loss_list['train'][-1], loss_list['test'][-1],
                 loss_list['nslope'][-1], crnn_model.pgradnorm()))
@@ -338,9 +362,9 @@ if __name__ == "__main__":
 
     # here we test the CRNN for am unseen initial condition
     sol = solve_ivp(ode,
-                    t_span=[0, args.t_end],
+                    t_span=[0, args.t_end*10],
                     y0=y0,
-                    t_eval=np.linspace(0, args.t_end, args.n_steps),
+                    t_eval=np.linspace(0, args.t_end*10, args.n_steps),
                     method='BDF',
                     dense_output=False,
                     vectorized=False)
@@ -348,9 +372,9 @@ if __name__ == "__main__":
     odeNN = ReactorOdeNN(crnn_model)
 
     solNN = solve_ivp(odeNN,
-                      t_span=[0, args.t_end],
+                      t_span=[0, args.t_end*10],
                       y0=y0,
-                      t_eval=np.linspace(0, args.t_end, args.n_steps),
+                      t_eval=np.linspace(0, args.t_end*10, args.n_steps),
                       method='BDF',
                       dense_output=False,
                       vectorized=False)
