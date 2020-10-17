@@ -1,23 +1,24 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# # Case 1: CRNN with five species and four reactions
+# # Case 2: CRNN with six species and three reactions
 #
-# This example is reffered as the case 1 in the CRNN paper:
+# This example is reffered as the case 2 in the CRNN paper:
 # * Ji, Weiqi, and Sili Deng. "Autonomous Discovery of Unknown Reaction Pathways
 # from Data by Chemical Reaction Neural Network." arXiv preprint arXiv:2002.09062 (2020).
 # [link](https://arxiv.org/abs/2002.09062)
 
 
-# This demo code can be run in CPU within couple of minites.
+# Initial conditions (data generation) matters a lot
 
-import os
 import argparse
+import os
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+from scipy import stats
 from scipy.integrate import solve_ivp
 from sklearn.model_selection import train_test_split
 from torch import mm
@@ -25,42 +26,62 @@ from torch.autograd import Variable
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-parser = argparse.ArgumentParser('case 1')
-parser.add_argument('--ns', type=int, default=5)
-parser.add_argument('--nr', type=int, default=4)
-parser.add_argument('--n_exp', type=int, default=100)
-parser.add_argument('--t_end', type=float, default=20)
+parser = argparse.ArgumentParser('case 2')
+parser.add_argument('--ns', type=int, default=6)
+parser.add_argument('--nr', type=int, default=3)
+parser.add_argument('--n_exp', type=int, default=300)
+parser.add_argument('--t_end', type=float, default=200)
 parser.add_argument('--n_steps', type=int, default=101)
 parser.add_argument('--learning_rate', type=float, default=1e-3)
-parser.add_argument('--batch_size', type=int, default=128)
-parser.add_argument('--nepochs', type=int, default=1000)
-parser.add_argument('--print_freq', type=int, default=100)
-parser.add_argument('--checkfile', type=str, default='alpha_case_1_5s4r')
+parser.add_argument('--batch_size', type=int, default=256)
+parser.add_argument('--nepochs', type=int, default=100000)
+parser.add_argument('--print_freq', type=int, default=500)
+parser.add_argument('--checkfile', type=str, default='alpha_case_2')
 parser.add_argument('--is_pruning', action='store_true', default=False)
 parser.add_argument('--pruning_threshhold', type=float, default=1e-2)
+parser.add_argument('--adaptive_slope', action='store_true', default=True)
 parser.add_argument('--is_restart', action='store_true', default=False)
 args = parser.parse_args()
 
+Ea_scale = 10.0
+
+
 class ReactorOde(object):
-    def __init__(self):
+    def __init__(self, k, ns):
         # parameters of the ODE systems and auxiliary data
         # are stored in the ReactorOde object
-        self.k = [0.1, 0.2, 0.13, 0.3]
-        self.dydt = np.zeros(5)
+        self.k = k
+        self.dydt = np.zeros(ns)
 
     def __call__(self, t, y):
         """the ODE function, y' = f(t,y) """
 
-        self.dydt[0] = -2 * self.k[0] * y[0]**2 - self.k[1] * y[0]
-        self.dydt[1] = self.k[0] * y[0]**2 - self.k[3] * y[1] * y[3]
-        self.dydt[2] = self.k[1] * y[0] - self.k[2] * y[2]
-        self.dydt[3] = self.k[2] * y[2] - self.k[3] * y[1] * y[3]
-        self.dydt[4] = self.k[3] * y[1] * y[3]
+        # TG,ROH,DG,MG,GL,R'CO2R
+
+        # TG
+        self.dydt[0] = - self.k[0] * y[0] * y[1]
+
+        # ROH
+        self.dydt[1] = (- self.k[0] * y[0] * y[1] -
+                        self.k[1] * y[2] * y[1] - self.k[2] * y[3] * y[1])
+
+        # DG
+        self.dydt[2] = self.k[0] * y[0] * y[1] - self.k[1] * y[2] * y[1]
+
+        # MG
+        self.dydt[3] = self.k[1] * y[2] * y[1] - self.k[2] * y[3] * y[1]
+
+        # GL
+        self.dydt[4] = self.k[2] * y[3] * y[1]
+
+        # R'CO2R
+        self.dydt[5] = (self.k[0] * y[0] * y[1] +
+                        self.k[1] * y[2] * y[1] + self.k[2] * y[3] * y[1])
 
         return self.dydt
 
 
-def get_solution(y0, t_end, n_steps):
+def get_solution(ode, y0, t_end, n_steps):
     '''Use solve_ivp from scipy to solve the ODE'''
     sol = solve_ivp(ode,
                     t_span=[0, t_end],
@@ -69,7 +90,7 @@ def get_solution(y0, t_end, n_steps):
                     method='BDF',
                     dense_output=False,
                     vectorized=False,
-                    rtol=1e-6,
+                    rtol=1e-3,
                     atol=1e-6)
     dydt = np.zeros_like(sol.y)
 
@@ -87,7 +108,7 @@ class CRNN_Model(nn.Module):
         self.ns = ns
         self.nr = nr
 
-        self.w_in = nn.Parameter(torch.zeros(ns, nr))
+        self.w_in = nn.Parameter(torch.zeros(ns+1, nr))
         self.w_b = nn.Parameter(torch.zeros(1, nr))
         self.w_out = nn.Parameter(torch.zeros(nr, ns))
 
@@ -95,7 +116,7 @@ class CRNN_Model(nn.Module):
             nn.init.uniform_(p, -0.1, 0.1)
 
         # adaptive weights
-        self.slope = nn.Parameter(torch.Tensor([0.1]))
+        self.slope = nn.Parameter(torch.Tensor([1.0]))
         self.n = torch.Tensor([10.0])
 
     def forward(self, input):
@@ -119,8 +140,10 @@ class CRNN_Model(nn.Module):
         print('nslope = {:.2f}'.format(nslope))
 
         print('w_in')
+        w_in = self.w_in.abs().T.data.numpy() * nslope
+        w_in[:, -1] *= Ea_scale
 
-        print(self.w_in.abs().T.data.numpy() * nslope)
+        print(w_in)
 
         print('w_b')
 
@@ -135,6 +158,13 @@ class CRNN_Model(nn.Module):
         scaled_w_out = self.w_out.T / w_out_max
 
         print(scaled_w_out.detach().numpy().T)
+
+    def share_params(self):
+        self.w_in.data[:-1, :] = (-self.w_out.T.data).clamp(0)
+        # for i in range(self.ns):
+        #     for j in range(self.ns):
+        #         if self.w_in.data[i, j].item() > 0.8:
+        #             self.w_out.data[j, i] = - self.w_in.data[i, j]
 
     def pnorm(self):
         '''Return the L2 norm of CRNN model parameters'''
@@ -162,15 +192,22 @@ class CRNN_Model(nn.Module):
 
 
 class ReactorOdeNN(object):
-    def __init__(self, model):
+    def __init__(self, crnn_model, T=300):
 
-        self.model = model
+        self.R = 1.98720425864083E-3
+
+        self.crnn_model = crnn_model
+
+        self.dydt = []
+
+        self.T = torch.Tensor([-Ea_scale / self.R / T]).view(1, 1)
 
     def __call__(self, t, y):
 
         with torch.no_grad():
-            y_log = torch.log(torch.Tensor(y).clamp(1e-6)).view(-1, 5)
-            dydt = self.model(y_log)[0]
+            y_log = torch.log(torch.Tensor(y).clamp(1e-6)).view(-1, 6)
+            input = torch.cat((y_log, self.T), dim=-1)
+            dydt = self.crnn_model(input)[0]
 
         return dydt
 
@@ -194,12 +231,12 @@ def makedirs(dirname):
 
 def monitor_train(label, pred, loss_list, fname=None):
     fig = plt.figure(figsize=(12, 7))
-    for i in range(5):
-        ax = fig.add_subplot(2, 3, i+1)
+    for i in range(6):
+        ax = fig.add_subplot(2, 4, i+1)
         ax.plot(label[:, i], pred[:, i].data.numpy(), 'o')
         ax.set_xlabel('Label')
         ax.set_ylabel('Pred')
-    ax = fig.add_subplot(2, 3, 5+1)
+    ax = fig.add_subplot(2, 4, 6+1)
     ax.plot(loss_list['train'], '-', lw=2, label='train')
     ax.plot(loss_list['test'], '--', lw=2, label='test')
     ax.set_yscale('log')
@@ -222,24 +259,51 @@ if __name__ == "__main__":
     makedirs('fig')
 
     # Generate Datasets
+    T_exp_list = np.array([50, 55, 60, 65]) + 273.15  # C -> K
+    k_list = np.zeros((3, 4))
+    k_list[0] = np.array([0.018, 0.024, 0.036, 0.048])
+    k_list[1] = np.array([0.036, 0.051, 0.070, 0.098])
+    k_list[2] = np.array([0.112, 0.158, 0.141, 0.191])
 
-    ode = ReactorOde()
+    R = 1.98720425864083E-3
+    A_list = np.zeros(3)
+    Ea_list = np.zeros(3)
+
+    for i in range(3):
+        slope, intercept, r_value, p_value, std_err = stats.linregress(x=1/T_exp_list, y=np.log(k_list[i]))  # noqa E501
+        print("Reaction {}: A = {:.2e} Ea = {:.2f} kcal/mol r_value = {:.4f} p_value = {:.4f}".
+              format(i, np.exp(intercept), R*slope, r_value, p_value))
+        A_list[i] = np.exp(intercept)
+        Ea_list[i] = R*slope
+
+    np.savez('./log/Arrhenius_Paras.npz', A_list=A_list, Ea_list=Ea_list)
+
     y_list = []
     dydt_list = []
+    T_list = np.random.uniform(50, 80, args.n_exp) + 273
 
     for i in range(args.n_exp):
-        y0 = np.random.uniform(np.array([0, 0, 0, 0, 0]),
-                               np.array([1, 1, 1, 1, 0]))
-        y, dydt = get_solution(y0, args.t_end, args.n_steps)
-        y_list.append(y.T)
+        k_vals = np.zeros(3)
+        for ir in range(3):
+            k_vals[ir] = A_list[ir]*np.exp(Ea_list[ir]/R/T_list[i])
+        y0 = np.random.uniform(np.array([0, 0, 0, 0, 0, 0]),
+                               np.array([1, 1, 1, 1, 1, 0]))
+        ode = ReactorOde(k=k_vals, ns=6)
+        y, dydt = get_solution(ode, y0, args.t_end, args.n_steps)
+        y_T = np.zeros((y.shape[0]+1, y.shape[1]))
+        y_T[:-1, :] = y
+        y_T[-1, :] = np.exp(-Ea_scale/R/T_list[i])
+        y_list.append(y_T.T)
         dydt_list.append(dydt.T)
     y_np = np.vstack(y_list)
+    eps = 1e-30
+    y_np = np.clip(y_np, eps, None)
     dydt_np = np.vstack(dydt_list)
 
     # Train CRNN Model
 
     crnn_model = CRNN_Model(ns=args.ns, nr=args.nr)
-    optimizer = torch.optim.Adam(crnn_model.parameters(), 
+    optimizer = torch.optim.Adam(crnn_model.parameters(),
                                  lr=args.learning_rate)
     loss_func = torch.nn.MSELoss()
 
@@ -250,15 +314,14 @@ if __name__ == "__main__":
 
     Y_max = torch.Tensor(dydt_np).abs().max(dim=0).values
 
-    eps = 1e-12
-    train_data = ODEDataSet(data=np.log(X_train+eps), label=Y_train)
+    train_data = ODEDataSet(data=np.log(X_train), label=Y_train)
     train_loader = DataLoader(train_data,
                               batch_size=args.batch_size,
                               shuffle=True,
                               drop_last=True,
                               pin_memory=False)
 
-    test_data = ODEDataSet(data=np.log(X_test+eps), label=Y_test)
+    test_data = ODEDataSet(data=np.log(X_test), label=Y_test)
     test_loader = DataLoader(test_data,
                              batch_size=args.batch_size,
                              shuffle=True,
@@ -274,7 +337,7 @@ if __name__ == "__main__":
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         epoch_old = checkpoint['epoch']
         loss_list = checkpoint['loss_list']
-        
+
         if args.is_pruning:
             for p in crnn_model.parameters():
                 mask = p.data.abs() < args.pruning_threshhold
@@ -291,27 +354,27 @@ if __name__ == "__main__":
         for i_sample, (data, label) in enumerate(train_loader):
             pred = crnn_model(data)
             loss = loss_func(pred/Y_max, label/Y_max)
-            
-            scaled_w_in = crnn_model.w_in.abs().T * crnn_model.nslope()
-            w_out_max = crnn_model.w_out.abs().max(dim=1).values + eps
-            scaled_k = torch.exp(crnn_model.w_b*crnn_model.nslope()) * w_out_max
-            scaled_w_out = crnn_model.w_out.T / w_out_max
 
-            loss_reg = alpha * (scaled_w_in.norm(1) + scaled_w_out.norm(1))
-            
-            loss += loss_reg
+            # scaled_w_in = crnn_model.w_in.abs().T * crnn_model.nslope()
+            # w_out_max = crnn_model.w_out.abs().max(dim=1).values + eps
+            # scaled_k = torch.exp(crnn_model.w_b*crnn_model.nslope()) * w_out_max  # noqa E501
+            # scaled_w_out = crnn_model.w_out.T / w_out_max
+            # loss_reg = alpha * (scaled_w_in.norm(1) + scaled_w_out.norm(1))
+            # loss += loss_reg
 
             optimizer.zero_grad()
             loss.backward()
-            # crnn_model.slope.grad.data *= 0
-            
+
+            if not args.adaptive_slope:
+                crnn_model.slope.grad.data *= 0
+
             # TODO: use scaled w_in and w_out.
             if args.is_pruning and args.is_restart:
                 for p in crnn_model.parameters():
                     mask = p.abs() < 0.01
                     p.grad.data[mask] *= 0
-            
             optimizer.step()
+            # crnn_model.share_params()
             loss_train += loss.item()
 
         loss_list['train'].append(loss_train/(i_sample+1))
@@ -357,36 +420,43 @@ if __name__ == "__main__":
     monitor_train(label, pred, loss_list, fname='./fig/regression_plot')
     crnn_model.show()
 
+    i = 10
+    k_vals = np.zeros(3)
+    for ir in range(3):
+        k_vals[ir] = A_list[ir]*np.exp(Ea_list[ir]/R/T_list[i])
+    ode = ReactorOde(k=k_vals, ns=6)
+
     # Posterior Validation by Coupling the CRNN into ODE integration
-    y0 = np.array([1, 1, 0, 0, 0])
+    y0 = np.array([1, 1, 0, 0, 0, 0])
 
     # here we test the CRNN for am unseen initial condition
     sol = solve_ivp(ode,
                     t_span=[0, args.t_end*10],
                     y0=y0,
-                    t_eval=np.linspace(0, args.t_end*10, args.n_steps),
+                    t_eval=np.linspace(0, args.t_end*10, args.n_steps*10),
                     method='BDF',
                     dense_output=False,
                     vectorized=False)
 
-    odeNN = ReactorOdeNN(crnn_model)
+    odeNN = ReactorOdeNN(crnn_model, T=T_list[i])
 
     solNN = solve_ivp(odeNN,
                       t_span=[0, args.t_end*10],
                       y0=y0,
-                      t_eval=np.linspace(0, args.t_end*10, args.n_steps),
+                      t_eval=np.linspace(0, args.t_end*10, args.n_steps*10),
                       method='BDF',
                       dense_output=False,
                       vectorized=False)
 
     fig = plt.figure(figsize=(12, 7))
-    for i in range(5):
-        ax = fig.add_subplot(2, 3, i+1)
+    for i in range(6):
+        ax = fig.add_subplot(2, 4, i+1)
         ax.plot(sol.t, sol.y[i, :], color='r', ls='solid', label='label')
         ax.plot(solNN.t, solNN.y[i, :], color='b', ls='dashed', label='crnn')
         ax.set_xlabel('Time')
         ax.set_ylabel('Conc.')
         ax.set_title('Species '+str(i+1))
+        ax.set_xlim([0, args.t_end])
         ax.legend()
     fig.tight_layout()
     plt.savefig('./fig/ode_crnn', dpi=120)
